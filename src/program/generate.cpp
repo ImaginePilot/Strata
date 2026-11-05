@@ -9794,24 +9794,62 @@ int main(int argc, char** argv) {
             const std::string base = dt_dir + "/conv-" + std::to_string(serial) + ".bin";
             strata::core::SessionWriteOptions wo;
             wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
-            size_t total = 0, b = 0;
+            size_t total = 0;
             std::string e;
-            if (!strata::core::session_file_write(base, img, *dt_id, b, e, wo)) {
-                ++dt_fail;
-                std::fprintf(stderr, "strata serve: disk tier: spill failed (%s)\n", e.c_str());
-                return;
-            }
-            total += b;
-            for (size_t k = 0; k < img.stage_images.size(); ++k) {
-                b = 0;
-                if (!strata::core::session_file_write(base + ".stage" + std::to_string(k + 1),
-                                                     img.stage_images[k], *dt_id, b, e, wo)) {
+            // #diskkv: a full store evicts its OLDEST image; it must never refuse its NEWEST insert.
+            // dt_cap is not the only thing that can bind - on a shared volume the disk itself does, and
+            // the writer's only move on a short disk is to fail its free-space preflight. Doing nothing
+            // here would discard the conversation most likely to be asked for next while stale images
+            // stay, which is backwards for an LRU store. So: drop the oldest and try again.
+            const auto dt_oldest = [&]() {
+                size_t old = 0;
+                for (size_t i = 1; i < dt.size(); ++i)
+                    if (dt[i].used < dt[old].used) old = i;
+                return old;
+            };
+            // A failure before the rename removes only its own temp file, but a failed .stage leaves the
+            // main file behind: clear it so nothing leaks and a retry does not fight our own litter.
+            const auto wipe_partial = [&]() {
+                std::error_code ec;
+                std::filesystem::remove(base, ec);
+                for (size_t k = 0; k < img.stage_images.size(); ++k)
+                    std::filesystem::remove(base + ".stage" + std::to_string(k + 1), ec);
+            };
+            const auto write_all = [&](strata::core::SessionStatus& st) {
+                total = 0;
+                size_t b = 0;
+                if (!strata::core::session_file_write(base, img, *dt_id, b, e, wo, &st)) return false;
+                total += b;
+                for (size_t k = 0; k < img.stage_images.size(); ++k) {
+                    b = 0;
+                    if (!strata::core::session_file_write(base + ".stage" + std::to_string(k + 1),
+                                                         img.stage_images[k], *dt_id, b, e, wo, &st))
+                        return false;
+                    total += b;
+                }
+                return true;
+            };
+            size_t made_room = 0;
+            for (;;) {
+                strata::core::SessionStatus st;
+                if (write_all(st)) break;
+                wipe_partial();
+                // Only `storage` is about space. invalid/memory/io are not, and evicting for them would
+                // throw away good conversations to no purpose. dt shrinks every pass, so this terminates.
+                if (st.error != strata::core::SessionError::storage || dt.empty()) {
                     ++dt_fail;
-                    std::fprintf(stderr, "strata serve: disk tier: stage spill failed (%s)\n", e.c_str());
+                    std::fprintf(stderr, "strata serve: disk tier: spill failed (%s)%s\n", e.c_str(),
+                                 st.error == strata::core::SessionError::storage
+                                     ? " - nothing left to evict" : "");
                     return;
                 }
-                total += b;
+                dt_drop(dt_oldest());
+                ++made_room;
             }
+            if (made_room)
+                std::fprintf(stderr, "strata serve: disk tier: evicted %zu oldest image(s) to make room "
+                                     "(the volume bound, not the %zu GiB cap)\n",
+                             made_room, (size_t) (dt_cap >> 30));
             DiskEntry de;
             de.ids = img.live.ids;
             de.imgs = img.live.imgs;
