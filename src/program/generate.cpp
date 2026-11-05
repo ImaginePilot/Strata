@@ -9696,6 +9696,295 @@ int main(int argc, char** argv) {
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
             return v;
         };
+        // ===== #diskkv: the automatic disk tier ==========================================
+        // A conversation the RAM cache evicts is written here instead of being dropped, and read back
+        // when a later prompt starts with its tokens.  A parked image is host-side, so the spill is
+        // pure host work - no device, no stream, no sync.  One file per stage (path, path.stageN), the
+        // same v1 format the SAVE command writes.  Off unless STRATA_DISK_TIER names a directory.
+        struct DiskEntry {
+            std::vector<int32_t> ids;
+            std::vector<ImgKey> imgs;
+            std::vector<std::vector<int32_t>> ck_ids;    // #diskkv: checkpoint prefixes, deepest first
+            std::vector<std::vector<ImgKey>> ck_imgs;
+            bool cvec = true;
+            std::string path;
+            size_t bytes = 0;
+            uint64_t used = 0;
+        };
+        std::vector<DiskEntry> dt;
+        const char* dt_env = std::getenv("STRATA_DISK_TIER");
+        const std::string dt_dir = dt_env != nullptr ? std::string(dt_env) : std::string();
+        const size_t dt_cap = [] {
+            const char* g = std::getenv("STRATA_DISK_TIER_GIB");
+            const long v = g != nullptr ? std::atol(g) : 200;
+            return (size_t) (v > 0 ? v : 200) << 30;
+        }();
+        uint64_t dt_clock = 0, dt_spills = 0, dt_hits = 0, dt_fail = 0;
+        size_t dt_bytes = 0;
+        int64_t dt_resume = -1;
+        int64_t dt_upto = -1;   // #diskkv: restore depth when a checkpoint matched
+        std::vector<int32_t> dt_live;        // #diskkv: that checkpoint's ids, straight from the index
+        std::vector<ImgKey> dt_live_imgs;
+        std::optional<strata::core::SessionFileIdentity> dt_id;
+        if (!dt_dir.empty()) {
+            std::error_code dec;
+            std::filesystem::create_directories(dt_dir, dec);
+            std::fprintf(stderr, "strata serve: disk tier at %s, cap %zu GiB\n", dt_dir.c_str(), dt_cap >> 30);
+        }
+        auto dt_drop = [&](size_t i) {
+            std::error_code ec;
+            std::filesystem::remove(dt[i].path, ec);
+            std::filesystem::remove(dt[i].path + ".idx", ec);   // #diskkv: the sidecar goes with it
+            for (size_t k = 0; k < 64; ++k) {
+                const std::string sp = dt[i].path + ".stage" + std::to_string(k + 1);
+                if (!std::filesystem::exists(sp, ec)) break;
+                std::filesystem::remove(sp, ec);
+            }
+            dt_bytes -= std::min(dt_bytes, dt[i].bytes);
+            dt.erase(dt.begin() + (std::ptrdiff_t) i);
+        };
+        // #diskkv: the identity was computed lazily on first spill. With a persisted index a READ can
+        // now happen before any spill in this process, and the read path dereferences *dt_id - so both
+        // sides go through here.
+        auto dt_ensure_id = [&]() {
+            if (dt_id) return true;
+            strata::core::SessionFileIdentity sid;
+            std::string e;
+            if (!session_identity(sid, e, [] {})) { ++dt_fail; return false; }
+            dt_id = sid;
+            return true;
+        };
+        const auto dt_idx_path = [](const std::string& base) { return base + ".idx"; };
+        // One sidecar per entry: the ids/images of the live tail and of the indexed checkpoints - the
+        // only things a match needs, and all that the in-process index held. Host byte order and no
+        // version negotiation beyond the magic: this is a local cache, and a sidecar that does not
+        // parse costs its image, nothing more.
+        auto dt_idx_write = [&](const DiskEntry& de) {
+            const std::string tmp = dt_idx_path(de.path) + ".tmp";
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            auto u64 = [&](uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); };
+            auto wids = [&](const std::vector<int32_t>& v) {
+                u64(v.size());
+                if (!v.empty()) f.write(reinterpret_cast<const char*>(v.data()), (std::streamsize) (v.size() * 4));
+            };
+            auto wimgs = [&](const std::vector<ImgKey>& v) {
+                u64(v.size());
+                if (!v.empty())
+                    f.write(reinterpret_cast<const char*>(v.data()), (std::streamsize) (v.size() * sizeof(ImgKey)));
+            };
+            f.write("STDTIDX1", 8);
+            const uint8_t cv = de.cvec ? 1 : 0;
+            f.write(reinterpret_cast<const char*>(&cv), 1);
+            u64(de.bytes);
+            wids(de.ids); wimgs(de.imgs);
+            u64(de.ck_ids.size());
+            for (size_t q = 0; q < de.ck_ids.size(); ++q) { wids(de.ck_ids[q]); wimgs(de.ck_imgs[q]); }
+            f.flush();
+            const bool ok = f.good();
+            f.close();
+            std::error_code ec;
+            if (!ok) { std::filesystem::remove(tmp, ec); return false; }
+            std::filesystem::rename(tmp, dt_idx_path(de.path), ec);   // atomic: a torn .idx is never seen
+            if (ec) { std::filesystem::remove(tmp, ec); return false; }
+            return true;
+        };
+        auto dt_spill = [&](const strata::core::SavedConversation& img, uint64_t serial) {
+            if (dt_dir.empty() || img.live.ids.empty()) return;
+            if (!dt_ensure_id()) return;
+            const std::string base = dt_dir + "/conv-" + std::to_string(serial) + ".bin";
+            strata::core::SessionWriteOptions wo;
+            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+            size_t total = 0, b = 0;
+            std::string e;
+            if (!strata::core::session_file_write(base, img, *dt_id, b, e, wo)) {
+                ++dt_fail;
+                std::fprintf(stderr, "strata serve: disk tier: spill failed (%s)\n", e.c_str());
+                return;
+            }
+            total += b;
+            for (size_t k = 0; k < img.stage_images.size(); ++k) {
+                b = 0;
+                if (!strata::core::session_file_write(base + ".stage" + std::to_string(k + 1),
+                                                     img.stage_images[k], *dt_id, b, e, wo)) {
+                    ++dt_fail;
+                    std::fprintf(stderr, "strata serve: disk tier: stage spill failed (%s)\n", e.c_str());
+                    return;
+                }
+                total += b;
+            }
+            DiskEntry de;
+            de.ids = img.live.ids;
+            de.imgs = img.live.imgs;
+            // #diskkv: the image's checkpoints are prefix candidates - a re-sent prompt is SHORTER than the
+            // live tail (which holds the generated tokens), so the live ids alone would never match it.
+            {
+                // Deepest first, but keep the WHOLE chain (capped): a later request can arrive at any
+                // depth, and indexing only the deepest few left nothing to match a prompt re-sent
+                // without its reply. Checkpoints come from prefill, which this tier removes, so they
+                // are scarce - index every one we are given.
+                std::vector<size_t> order(img.checkpoints.size());
+                for (size_t q = 0; q < order.size(); ++q) order[q] = q;
+                std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    return img.checkpoints[a].ids.size() > img.checkpoints[b].ids.size();
+                });
+                for (size_t q = 0; q < order.size() && de.ck_ids.size() < 16; ++q) {
+                    const auto& c = img.checkpoints[order[q]];
+                    if (c.ids.empty()) continue;
+                    de.ck_ids.push_back(c.ids);
+                    de.ck_imgs.push_back(c.imgs);
+                }
+            }
+            de.cvec = img.cvec;
+            de.path = base;
+            de.bytes = total;
+            de.used = ++dt_clock;
+            // #diskkv: the same supersede rule the RAM cache applies in put() via drop_superseded()
+            // (conversation_cache.hpp:430): an entry whose DEEPEST checkpoint this outgoing chain also
+            // holds is this conversation at an earlier turn, and the new image holds everything it did.
+            // Without this the store kept one ~940 MiB copy per eviction, so a handful of conversations
+            // filled the cap with duplicates (measured: 10 -> 118 entries, 111 GiB, in 10 minutes) and
+            // the cap bought a dozen histories instead of hundreds.
+            // Note: the index keeps only the 4 deepest checkpoints per entry, so this is conservative --
+            // it can miss a match the full chain would catch, never drop an entry the rule would keep.
+            size_t superseded = 0;
+            for (size_t i = dt.size(); i-- > 0; ) {
+                const DiskEntry& prev = dt[i];
+                if (prev.cvec != de.cvec) continue;
+                // Never drop a checkpointed entry for one with no checkpoints: a checkpoint is the only
+                // thing a re-sent SHORTER prompt can match, prefill is the only thing that makes one, and
+                // this tier removes prefill. Measured consequence of getting this wrong: after 15 minutes
+                // every entry had ck=0 and cross-restart resume failed 0/3.
+                if (!prev.ck_ids.empty() && de.ck_ids.empty()) continue;
+                bool holds = false;
+                if (!prev.ck_ids.empty() && !prev.ck_ids[0].empty()) {
+                    const std::vector<int32_t>& dids = prev.ck_ids[0];   // deepest: pushed in descending order
+                    const std::vector<ImgKey>& dimgs = prev.ck_imgs[0];
+                    holds = dids == de.ids && dimgs == de.imgs;          // it is the new live state, or
+                    for (size_t q = 0; !holds && q < de.ck_ids.size(); ++q)   // a checkpoint the new chain carries
+                        if (de.ck_ids[q] == dids && de.ck_imgs[q] == dimgs) holds = true;
+                } else if (!de.ck_ids.empty() && prev.ids.size() <= de.ids.size()) {
+                    // No usable checkpoint: this entry was spilled MID-PREFILL, before the first one was
+                    // taken. The rule above can never match it, and unlike the RAM cache's handful of
+                    // slots this LRU is hundreds of entries deep, so it would sit here crowding out live
+                    // conversations (measured: +30 permanent entries per 80 spills, ~2.6 GB/min).
+                    // Its live ids being a prefix of ours means our image covers every token it held.
+                    // We require that we carry at least one indexed checkpoint, so a request that used to
+                    // match it still has a mount point here. That is not provably lossless - a request at
+                    // exactly its depth could miss if our checkpoints sit elsewhere - but the cost is one
+                    // extra prefill, never a wrong answer.
+                    bool pre = true;
+                    for (size_t j = 0; j < prev.ids.size(); ++j)
+                        if (prev.ids[j] != de.ids[j]) { pre = false; break; }
+                    if (pre && prev.imgs == imgs_below(de.imgs, (int64_t) prev.ids.size())) holds = true;
+                }
+                if (holds) { dt_drop(i); ++superseded; }
+            }
+            if (!dt_idx_write(de))
+                std::fprintf(stderr, "strata serve: disk tier: WARNING could not write %s; this conversation "
+                                     "will not survive an engine restart\n", dt_idx_path(de.path).c_str());
+            dt_bytes += total;
+            dt.push_back(std::move(de));
+            ++dt_spills;
+            while (dt_bytes > dt_cap && dt.size() > 1) {
+                size_t old = 0;
+                for (size_t i = 1; i < dt.size(); ++i) if (dt[i].used < dt[old].used) old = i;
+                dt_drop(old);
+            }
+            std::fprintf(stderr, "strata serve: disk tier: spilled %lld tokens (%zu MiB); store %zu entries, %zu MiB "
+                                 "(superseded %zu, spills %llu hits %llu fail %llu)\n",
+                         (long long) img.live.ids.size(), total >> 20,
+                         dt.size(), dt_bytes >> 20, superseded, (unsigned long long) dt_spills,
+                         (unsigned long long) dt_hits, (unsigned long long) dt_fail);
+        };
+        auto dt_idx_load = [&]() {
+            if (dt_dir.empty()) return;
+            std::error_code ec;
+            if (!std::filesystem::is_directory(dt_dir, ec)) return;
+            const uint64_t kMaxTok = 8u << 20;   // a corrupt count must never drive the allocation
+            size_t found = 0, dropped = 0;
+            std::vector<std::filesystem::path> bins;
+            for (const auto& it : std::filesystem::directory_iterator(dt_dir, ec)) {
+                const std::string p = it.path().string();
+                if (p.size() > 4 && p.compare(p.size() - 4, 4, ".bin") == 0) bins.push_back(it.path());
+            }
+            std::sort(bins.begin(), bins.end());
+            for (const auto& bp : bins) {
+                const std::string base = bp.string();
+                DiskEntry de;
+                bool ok = false;
+                {
+                    std::ifstream f(dt_idx_path(base), std::ios::binary);
+                    auto u64 = [&](uint64_t& v) { f.read(reinterpret_cast<char*>(&v), 8); return (bool) f; };
+                    auto rids = [&](std::vector<int32_t>& v) {
+                        uint64_t n = 0;
+                        if (!u64(n) || n > kMaxTok) return false;
+                        v.resize((size_t) n);
+                        if (n != 0) f.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * 4));
+                        return (bool) f;
+                    };
+                    auto rimgs = [&](std::vector<ImgKey>& v) {
+                        uint64_t n = 0;
+                        if (!u64(n) || n > kMaxTok) return false;
+                        v.resize((size_t) n);
+                        if (n != 0)
+                            f.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (n * sizeof(ImgKey)));
+                        return (bool) f;
+                    };
+                    char magic[8] = {};
+                    uint8_t cv = 0;
+                    uint64_t by = 0, nck = 0;
+                    if (f) f.read(magic, 8);
+                    if (f && std::memcmp(magic, "STDTIDX1", 8) == 0) {
+                        f.read(reinterpret_cast<char*>(&cv), 1);
+                        if ((bool) f && u64(by) && rids(de.ids) && rimgs(de.imgs) && u64(nck) && nck <= 64) {
+                            ok = true;
+                            for (uint64_t q = 0; q < nck && ok; ++q) {
+                                std::vector<int32_t> ci;
+                                std::vector<ImgKey> cm;
+                                if (rids(ci) && rimgs(cm)) {
+                                    de.ck_ids.push_back(std::move(ci));
+                                    de.ck_imgs.push_back(std::move(cm));
+                                } else {
+                                    ok = false;
+                                }
+                            }
+                        }
+                    }
+                    if (de.ids.empty()) ok = false;
+                    de.cvec = cv != 0;
+                    de.bytes = (size_t) by;
+                }
+                if (!ok) {   // an image no index can describe can never be matched: it is dead weight
+                    std::filesystem::remove(bp, ec);
+                    std::filesystem::remove(dt_idx_path(base), ec);
+                    for (size_t k = 0; k < 64; ++k) {
+                        const std::string sp = base + ".stage" + std::to_string(k + 1);
+                        if (!std::filesystem::exists(sp, ec)) break;
+                        std::filesystem::remove(sp, ec);
+                    }
+                    ++dropped;
+                    continue;
+                }
+                de.path = base;
+                de.used = ++dt_clock;
+                dt_bytes += de.bytes;
+                dt.push_back(std::move(de));
+                ++found;
+            }
+            if (found != 0 || dropped != 0)
+                std::fprintf(stderr, "strata serve: disk tier: recovered %zu conversation%s (%zu MiB) from %s, "
+                                     "dropped %zu with no usable index\n", found, found == 1 ? "" : "s",
+                             dt_bytes >> 20, dt_dir.c_str(), dropped);
+            while (dt_bytes > dt_cap && dt.size() > 1) {
+                size_t old_i = 0;
+                for (size_t i = 1; i < dt.size(); ++i) if (dt[i].used < dt[old_i].used) old_i = i;
+                dt_drop(old_i);
+            }
+        };
+        if (!dt_dir.empty()) {
+            conversations.set_on_evict([&](const strata::core::SavedConversation& img, uint64_t serial) { dt_spill(img, serial); });
+            dt_idx_load();   // #diskkv: pick up what earlier runs of this engine left on disk
+        }
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
         // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
@@ -12865,6 +13154,86 @@ int main(int argc, char** argv) {
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
             if (incoming || borrow) slot_source = -1;
+            // #diskkv: nothing in RAM beats this prompt - try the disk tier (the longest spilled prefix)
+            dt_resume = -1;
+            dt_upto = -1;
+            // #diskkv: gate on having something to match, NOT on dt_id - only a spill sets that, so a
+            // restart that recovered its index from disk would never look (measured: 0 reads, 0/2 resumed).
+            // The read path below establishes the identity itself.
+            if (!incoming && !borrow && !dt_dir.empty() && !dt.empty()) {
+                size_t pick = SIZE_MAX;
+                int64_t pick_upto = -1;   // #diskkv: >=0 when the match is a checkpoint, not the live tail
+                std::vector<int32_t> pick_live;
+                std::vector<ImgKey> pick_live_imgs;   // #diskkv
+                int64_t pick_tok = std::max(resume, slot_tokens);
+                if ((int64_t) parked.tokens > pick_tok) pick_tok = (int64_t) parked.tokens;
+                auto dt_pre_ok = [&](const std::vector<int32_t>& cand, const std::vector<ImgKey>& cimgs) {
+                    const int64_t L = (int64_t) cand.size();
+                    if (L <= pick_tok || L > (int64_t) ids.size()) return false;
+                    for (int64_t j = 0; j < L; ++j)
+                        if ((int32_t) ids[(size_t) j] != cand[(size_t) j]) return false;
+                    return imgs_below(req_imgs, L) == cimgs;
+                };
+                for (size_t i = 0; i < dt.size(); ++i) {
+                    const DiskEntry& de = dt[i];
+                    if (de.cvec != want_cvec) continue;
+                    if (dt_pre_ok(de.ids, de.imgs)) { pick = i; pick_tok = (int64_t) de.ids.size(); pick_upto = -1; }
+                    for (size_t q = 0; q < de.ck_ids.size(); ++q)
+                        if (dt_pre_ok(de.ck_ids[q], de.ck_imgs[q])) {
+                            pick = i;
+                            pick_tok = (int64_t) de.ck_ids[q].size();
+                            pick_upto = pick_tok;   // a checkpoint: restore only this far
+                            pick_live = de.ck_ids[q]; pick_live_imgs = de.ck_imgs[q];
+                        }
+                }
+                if (pick != SIZE_MAX) {
+                    strata::core::SavedConversation dimg;
+                    std::string de_err;
+                    size_t rb = 0, rtot = 0;
+                    strata::core::SessionReadLimits lim0;
+                    bool ok = strata::core::conversation_session_read_limits(
+                        lim0, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                        (uint64_t) std::max(o.prompt_cache, 1), de_err);
+                    if (ok && !dt_ensure_id()) { ok = false; de_err = "disk tier: no session identity"; }
+                    if (ok) ok = strata::core::session_file_read(dt[pick].path, *dt_id, dimg, rb, de_err, lim0);
+                    rtot += rb;
+                    if (ok && !stages.empty()) {
+                        dimg.stage_images.clear();
+                        dimg.stage_images.resize(stages.size());
+                        for (size_t k = 0; k < stages.size() && ok; ++k) {
+                            strata::core::SessionReadLimits lk;
+                            if (!strata::core::conversation_session_read_limits(
+                                    lk, stages[k]->ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                    (uint64_t) std::max(o.prompt_cache, 1), de_err)) { ok = false; break; }
+                            rb = 0;
+                            ok = strata::core::session_file_read(dt[pick].path + ".stage" + std::to_string(k + 1),
+                                                                 *dt_id, dimg.stage_images[k], rb, de_err, lk);
+                            rtot += rb;
+                        }
+                    }
+                    if (ok) {
+                        // #diskkv: a checkpoint match restores just that prefix (the image holds more)
+                        if (pick_upto >= 0) {
+                            dt_upto = pick_upto;
+                            dt_live = std::move(pick_live); dt_live_imgs = std::move(pick_live_imgs);
+                        }
+                        incoming.emplace(std::move(dimg));
+                        dt[pick].used = ++dt_clock;
+                        dt_resume = pick_tok;
+                        ++dt_hits;
+                        slot_source = -1;
+                        std::fprintf(stderr, "strata serve: disk tier: read %lld tokens (%zu MiB) back - no prefill "
+                                             "(mode=%s; %llu hits, %llu spills this run, %zu entries)\n",
+                                     (long long) pick_tok, rtot >> 20, dt_upto >= 0 ? "ckpt" : "tail",
+                                     (unsigned long long) dt_hits, (unsigned long long) dt_spills, dt.size());
+                    } else {
+                        ++dt_fail;
+                        std::fprintf(stderr, "strata serve: disk tier: %s unusable, dropping it (%s)\n",
+                                     dt[pick].path.c_str(), de_err.c_str());
+                        dt_drop(pick);
+                    }
+                }
+            }
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -13034,9 +13403,23 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
-                    strata::core::ConversationRestore::restored) {
+                const auto* r_draft0 =
+                    use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr;
+                // #diskkv: a disk-tier checkpoint match mounts only the first dt_upto tokens, like a borrow.
+                // restore_prefix refuses an image that still carries its stage children ("a layer split's
+                // image restored as a single session"), so detach them across stage 0's call and put them
+                // back; every stage is then mounted to the same depth below. Nothing here can throw.
+                const auto restore_stage0 = [&]() {
+                    if (dt_upto < 0)
+                        return strata::core::conversation_snapshot_restore(*incoming, ss, g, r_draft0, err);
+                    auto kids = std::move(incoming->stage_images);
+                    incoming->stage_images.clear();
+                    const auto rc = strata::core::conversation_snapshot_restore_prefix(
+                        *incoming, dt_upto, ss, g, r_draft0, err);
+                    incoming->stage_images = std::move(kids);
+                    return rc;
+                };
+                if (restore_stage0() != strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
                     std::printf("ERR restoring parked conversation: %s\n", err.c_str());
@@ -13044,8 +13427,13 @@ int main(int argc, char** argv) {
                 }
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                    const auto* r_draftk =
+                        use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr;
+                    if ((dt_upto >= 0
+                             ? strata::core::conversation_snapshot_restore_prefix(
+                                   incoming->stage_images[i], dt_upto, stages[i]->ss, g, r_draftk, err)
+                             : strata::core::conversation_snapshot_restore(
+                                   incoming->stage_images[i], stages[i]->ss, g, r_draftk, err)) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());
@@ -13078,9 +13466,24 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
-                resume = parked.tokens;
-                from_live = parked.live;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                resume = dt_resume >= 0 ? dt_resume : parked.tokens;   // #diskkv
+                from_live = dt_resume >= 0 ? (dt_upto < 0) : parked.live;   // #diskkv
+                if (dt_upto >= 0) {   // #diskkv: the checkpoint IS the live state now; deeper ones are not this prompt's
+                    decltype(checks) keep;   // deeper checkpoints describe KV this restore did not mount
+                    for (auto& c : checks)
+                        if ((int64_t) c.ids.size() <= dt_upto) keep.push_back(std::move(c));
+                    checks = std::move(keep);
+                    // From the index, not from `checks`: a failed checkpoint merge clears `checks`, and
+                    // `live` must still match the dt_upto cells actually on the device.
+                    live = std::move(dt_live);
+                    live_imgs = std::move(dt_live_imgs);
+                    if ((int64_t) live.size() != dt_upto) {
+                        std::printf("ERR disk tier: checkpoint ids %zu != restored depth %lld\n",
+                                    live.size(), (long long) dt_upto);
+                        return 1;
+                    }
+                }
+                if (dt_upto < 0 && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {   // #diskkv
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));

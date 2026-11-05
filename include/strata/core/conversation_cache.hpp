@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <deque>
 #include <utility>
 #include <vector>
@@ -308,6 +309,8 @@ public:
     void unguard() { guarded_ = 0; }
     bool guard_blocked() const { return guard_blocked_; }
     size_t borrowed() const { return borrowed_; }
+    /// #diskkv: called with each image about to be evicted, before it is dropped (may be empty).
+    void set_on_evict(std::function<void(const SavedConversation&, uint64_t)> f) { on_evict_ = std::move(f); }
     void count_borrow() { ++borrowed_; }
 
     // Reserve before allocating a snapshot. held is an incoming image removed
@@ -342,6 +345,8 @@ public:
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            // #diskkv: spill this image before it is dropped (a parked image is host-side, so this is host work)
+            if (on_evict_) on_evict_(entries_[i], serials_[i]);
             bytes_ -= entries_[i].bytes();
             erase(i);
             ++evictions_;
@@ -441,6 +446,7 @@ private:
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
+    std::function<void(const SavedConversation&, uint64_t)> on_evict_;   // #diskkv
     ConversationKvReuse reuse_;
 };
 

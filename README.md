@@ -11,7 +11,7 @@
 <p align="center">
   <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
   <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
+  <a href="#disk-kv-this-fork">Disk KV</a> · <a href="#help">Help</a> · <a href="#support-strata">Support</a>
 </p>
 
 <p align="center">
@@ -23,6 +23,25 @@
 <p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a></sub></p>
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+
+## Disk KV (this fork)
+
+This fork keeps conversation K/V on **disk**, so a long prompt is prefilled once and reused later —
+after the RAM conversation cache has evicted it, and after the engine has restarted.
+
+- **An automatic evict-to-disk tier.** A conversation the RAM cache would drop is spilled to disk and
+  read back on a later match, with no client changes. It works with `--layer-split` *and* with
+  `--batch` (parallel requests). Enable with `STRATA_DISK_TIER=<dir>`.
+- **Explicit session files on a layer split.** `SESSION save` / `restore` previously refused whenever
+  stages were in use; now a split writes one file per stage, with no change to the v1 file format.
+
+Measured on 4 × RTX 3080 with a 125B MoE at a 41k-token history: **100% prompt reuse on 212/212
+revisits**, ttft **2.9–3.8 s** against **16–23 s** for a cold prefill, and the store held flat by the
+same supersede rule the RAM cache uses.
+
+**Read [docs/DISK_KV_TIER.md](docs/DISK_KV_TIER.md)** for setup, the recommended parameters and the
+reasoning behind each, full test reports, tuning by symptom, and the limitations — including which
+throughput numbers are *not* a measured win.
 
 ## Models
 
