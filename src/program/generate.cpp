@@ -12129,7 +12129,10 @@ int main(int argc, char** argv) {
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
-                if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                // #diskkv: a layer split writes one file per stage - stage 0 at `path`, the later stages at
+                // `path.stageN`.  The checkpoints are split into their stage parts for the capture, exactly as
+                // parking does, so every image written carries no stage_parts and the v1 file format holds it.
+                if (stages.empty() && multi_gpu) { refuse("session files do not support this multi-GPU shape"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
@@ -12207,27 +12210,84 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
-                        strata::core::SavedConversation meta;
-                        std::vector<strata::core::SessionKvSource> sources;
-                        // the live running state comes off the device in one synchronous copy
-                        blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
-                            refuse(err, strata::core::SessionError::io);
-                            continue;
-                        }
-                        capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
-                        wo.progress = moving;
+                        // #diskkv: the single-GPU branch keeps the plain callback; the split branch offsets it so that
+                        // SESSION `done` never goes backwards across the per-stage files (serve/server.py requires that).
+                        uint64_t prog_base = 0;
+                        auto moving_at = [&](uint64_t done, uint64_t total) { moving(prog_base + done, prog_base + total); };
                         wo.phase = blocking;
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
-                            refuse(err, st.error, st.published);
-                            continue;
+                        const size_t n_st = stages.size();
+                        const bool have_mtp = !o.mtp.empty();
+                        bool save_ok = true;
+                        if (n_st == 0) {
+                            const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                            strata::core::SavedConversation meta;
+                            std::vector<strata::core::SessionKvSource> sources;
+                            // the live running state comes off the device in one synchronous copy
+                            blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+                            if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(), err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                save_ok = false;
+                            } else {
+                                capture_ms = ms();
+                                wo.progress = moving;
+                                if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
+                                    refuse(err, st.error, st.published);
+                                    save_ok = false;
+                                }
+                            }
+                        } else {
+                            // #diskkv: one image per stage, each captured under its own device and written to its own file.
+                            // `disk_checks` holds copies (session_save_checkpoints takes the chain by const ref), so the
+                            // split is destructive here and the live session's checkpoints are untouched.
+                            strata::core::ConversationCheckpointSplit cs =
+                                strata::core::conversation_checkpoints_split(std::move(disk_checks), n_st);
+                            blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+                            const strata::core::ConversationView view0{live, live_imgs, cs.stage0, cvec_cached};
+                            strata::core::SavedConversation image0;
+                            if (!strata::core::conversation_snapshot_save(image0, view0, ss, g,
+                                    have_mtp && mtp_first ? &mtp.kv_state() : nullptr, err)) {
+                                refuse(err, strata::core::SessionError::io);
+                                save_ok = false;
+                            } else {
+                                capture_ms = ms();
+                                wo.progress = moving_at;
+                                if (!strata::core::session_file_write(path, image0, id, bytes, err, wo, &st)) {
+                                    refuse(err, st.error, st.published);
+                                    save_ok = false;
+                                }
+                                prog_base += bytes;   // #diskkv
+                            }
+                            for (size_t k = 0; save_ok && k < n_st; ++k) {
+                                const strata::core::OnDevice on(stages[k]->dev);
+                                if (cudaDeviceSynchronize() != cudaSuccess) {
+                                    refuse("stage sync failed before the capture", strata::core::SessionError::io);
+                                    save_ok = false;
+                                    break;
+                                }
+                                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                                strata::core::SavedConversation part;
+                                // the draft layer's K/V lives on the last stage unless --mtp runs first (then on stage 0)
+                                if (!strata::core::conversation_snapshot_save(part, view_k, stages[k]->ss, g,
+                                        have_mtp && !mtp_first && k + 1 == n_st ? &mtp.kv_state() : nullptr, err)) {
+                                    refuse(err, strata::core::SessionError::io);
+                                    save_ok = false;
+                                    break;
+                                }
+                                size_t sb = 0;
+                                const std::string spath = path + ".stage" + std::to_string(k + 1);
+                                if (!strata::core::session_file_write(spath, part, id, sb, err, wo, &st)) {
+                                    refuse(err, st.error, st.published);
+                                    save_ok = false;
+                                    break;
+                                }
+                                bytes += sb;
+                                prog_base += sb;   // #diskkv
+                            }
                         }
-                        if (st.dir_flush_unsupported)
+                        if (!save_ok) continue;
                             std::fprintf(stderr, "strata serve: session saved to %s; this filesystem cannot flush a "
                                                  "folder, so the new name is not flushed\n", path.c_str());
                     } catch (const std::bad_alloc&) {
@@ -12268,6 +12328,38 @@ int main(int argc, char** argv) {
                             refuse(err, st.error);
                             continue;
                         }
+                        // #diskkv: a layer split's later stages, each from its own file with its own limits
+                        if (!stages.empty()) {
+                            bool read_ok = true;
+                            // #diskkv: stage 0's bytes are already reported, so the stages' progress continues from there
+                            // (serve/server.py requires SESSION `done` never to go backwards).
+                            uint64_t rprog_base = bytes;
+                            auto moving_r = [&](uint64_t done, uint64_t total) { moving(rprog_base + done, rprog_base + total); };
+                            image.stage_images.clear();
+                            image.stage_images.resize(stages.size());
+                            for (size_t k = 0; k < stages.size(); ++k) {
+                                strata::core::SessionReadLimits lim_k;
+                                lim_k.progress = moving_r;
+                                lim_k.admit = limits.admit;
+                                if (!strata::core::conversation_session_read_limits(
+                                        lim_k, stages[k]->ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                        (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                                    refuse(err, strata::core::SessionError::io);
+                                    read_ok = false;
+                                    break;
+                                }
+                                size_t sb = 0;
+                                const std::string spath = path + ".stage" + std::to_string(k + 1);
+                                if (!strata::core::session_file_read(spath, id, image.stage_images[k], sb, err, lim_k, &st)) {
+                                    refuse(err, st.error);
+                                    read_ok = false;
+                                    break;
+                                }
+                                bytes += sb;
+                                rprog_base += sb;   // #diskkv
+                            }
+                            if (!read_ok) continue;
+                        }
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
                         continue;
@@ -12275,7 +12367,24 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!stages.empty()) {   // #diskkv: each stage's image under its own device, before any device write
+                        bool val_ok = true;
+                        for (size_t k = 0; k < stages.size(); ++k) {
+                            const strata::core::OnDevice on(stages[k]->dev);
+                            if (!strata::core::conversation_snapshot_validate(image.stage_images[k], stages[k]->ss, g,
+                                    !o.mtp.empty() && !mtp_first && k + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {
+                                refuse(err);
+                                val_ok = false;
+                                break;
+                            }
+                        }
+                        if (!val_ok) continue;
+                    }
+                    const bool main_valid = stages.empty()
+                        ? strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)
+                        : strata::core::conversation_snapshot_validate(image, ss, g,
+                              !o.mtp.empty() && mtp_first ? &mtp.kv_state() : nullptr, err);
+                    if (!main_valid) {
                         refuse(err);
                         continue;
                     }
@@ -12288,8 +12397,11 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
-                        strata::core::ConversationRestore::restored) {
+                    const auto restore_rc = stages.empty()
+                        ? strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err)
+                        : strata::core::conversation_snapshot_restore(image, ss, g,
+                              !o.mtp.empty() && mtp_first ? &mtp.kv_state() : nullptr, err);
+                    if (restore_rc != strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
                         std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(),
@@ -12299,9 +12411,34 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
+                    for (size_t k = 0; !stages.empty() && k < stages.size(); ++k) {   // #diskkv
+                        const strata::core::OnDevice on(stages[k]->dev);
+                        if (strata::core::conversation_snapshot_restore(image.stage_images[k], stages[k]->ss, g,
+                                !o.mtp.empty() && !mtp_first && k + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            std::fprintf(stderr, "strata serve: session restore %s: stage CUDA%d transfer failed: %s\n",
+                                         path.c_str(), stages[k]->dev, err.c_str());
+                            std::printf("FATAL restoring a session file stage failed after the device state was changed: %s\n",
+                                        err.c_str());
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                        if (cudaDeviceSynchronize() != cudaSuccess) {
+                            std::printf("FATAL stage sync failed after a session restore\n");
+                            std::fflush(stdout);
+                            return 1;
+                        }
+                    }
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
-                    checks = std::move(image.checkpoints);
+                    if (stages.empty()) {
+                        checks = std::move(image.checkpoints);
+                    } else {   // #diskkv: each checkpoint takes its stage parts back (moved); none if they do not line up
+                        strata::core::ConversationCheckpointSplit cs;
+                        cs.stage0 = std::move(image.checkpoints);
+                        for (auto& si : image.stage_images) cs.parts.push_back(std::move(si.checkpoints));
+                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                    }
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
