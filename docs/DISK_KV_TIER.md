@@ -274,10 +274,40 @@ Be careful with the throughput figures. Stated plainly:
   serialised at `parallel: 2`; report D is 4-way concurrent at `parallel: 4`. They differ in more than
   one variable, so **D ÷ C is not a speedup**. The `parallel = stage count` recommendation rests on
   the `auto_groups()` argument in §4 plus "validated working", not on a measured win.
-- This rig shows **run-to-run decode drift of up to 2.8×** on byte-identical configs (49.5 → 79.1 →
-  137.2 tok/s across three identical runs). Cause unresolved; cold page cache, engine swapping,
-  sidecar RAM and GPU throttling were each ruled out. **Treat any single tok/s number from this rig,
-  including the ones above, as indicative only.**
+- **The run-to-run "decode drift" on this rig was co-tenant contention, not engine behaviour.**
+  Resolved 2026-11-05. 30 identical single-stream probes against the live engine, each tagged with
+  whether a foreign request decoded inside its own window:
+
+  | measurement window | n | min | median | max | spread | cv |
+  |---|---|---|---|---|---|---|
+  | engine alone | 19 | 87.4 | 90.4 | 93.8 | **1.07×** | 2.4% |
+  | sharing with other clients | 11 | 28.8 | 63.6 | 81.7 | **2.84×** | 20.2% |
+
+  Within one uninterrupted batch the engine is tighter than the pooled figure suggests: six
+  consecutive clean probes gave 87.7–88.3 tok/s, **cv 0.3%**.
+
+  The response is monotonic in the amount of foreign activity (23 interleaved foreign log lines →
+  61 tok/s; 6 → 64–68; 2 → 82; 0 → 90–94), and aggregate throughput is roughly conserved across
+  the sharers. **Single-stream decode on a quiet engine is stable to ±2%**, so the engine does not
+  drift — the measurement did.
+
+  Earlier this was recorded as unexplained 2.8× drift (49.5 → 79.1 → 137.2 tok/s over three
+  byte-identical arms, prime time 24.0 → 20.6 → 17.6 s). Contention reproduces that magnitude
+  exactly, and a co-tenant burst decaying across the arms would also produce the monotonic-with-arm-
+  position shape those runs showed — but **that specific bracket was not replayed under the gate
+  below**, so treat contention as the leading cause there rather than a proven one.
+
+  **Gate every throughput measurement on an idle engine.** Any shared engine will do this to you.
+  `bench/decode_contention_probe.py` does the gating: it brackets each request with the engine log
+  and reports the clean and contended samples separately, exiting non-zero if no clean sample was
+  obtained. The detector is that the engine logs `thinking: N of max M tokens` and `answering: ...`
+  per stream, so a cap `M` you did not send, or an `answering:` phase while your own request is
+  still capped mid-thinking, means you were sharing the batch.
+
+  ```
+  python bench/decode_contention_probe.py --runs 14
+  ``` Reuse, hit rate, store size, ttft and
+  cross-restart resume are **not** affected this way — only tok/s is.
 - Reports C–E are prompt-dominated by design (41k-token prompts against 150–2000 output tokens) to
   stress the tier. They **understate** what the config can do on decode.
 
